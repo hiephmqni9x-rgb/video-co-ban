@@ -339,7 +339,10 @@ def qa() -> None:
     info = probe(final)
     streams = info["streams"]
     duration = float(info["format"]["duration"])
-    checks = {"video": any(s.get("codec_type") == "video" for s in streams), "audio": any(s.get("codec_type") == "audio" for s in streams), "duration": abs(duration - expected) <= 0.25}
+    checks = {"video": any(s.get("codec_type") == "video" for s in streams),
+              "audio": any(s.get("codec_type") == "audio" for s in streams),
+              "duration": abs(duration - expected) <= 0.25,
+              "fresh_render": final.stat().st_mtime >= (PUBLIC / "timeline.json").stat().st_mtime}
     decode = subprocess.run([tool("ffmpeg"), "-v", "error", "-i", str(final), "-f", "null", "-"], capture_output=True, text=True)
     checks["full_decode"] = decode.returncode == 0
     report = {"status": "PASS" if all(checks.values()) else "NEEDS_REVIEW", "checks": checks, "expected_seconds": expected, "actual_seconds": duration, "decode_error": decode.stderr[-1000:]}
