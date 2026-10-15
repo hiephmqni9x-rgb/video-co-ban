@@ -1,71 +1,68 @@
 # video-co-ban
 
-Repo mẫu để học dựng video nói chuyện: **chọn phần giữ lại → cắt video → phụ đề trắng → xuất và kiểm tra**. FFmpeg xử lý hình/tiếng; Remotion làm tầng trình bày để bạn tự thêm hiệu ứng sau này. Bản mẫu chưa có zoom, icon, nhạc nền, stock clip hay hiệu ứng chữ.
+Repo học dựng video nói chuyện từ **một video quay bằng điện thoại**. Hệ thống tự phiên âm tiếng Việt, dùng AI sửa lời theo ngữ cảnh và **đề xuất** đoạn nên cắt. Người dùng quyết định cắt đoạn nào trước khi FFmpeg hoặc Remotion chạy. Bản đầu chỉ có phụ đề trắng; không có zoom, icon, stock clip, nhạc nền hay SFX.
 
-## Cài đặt
+## Chạy trên môi trường đám mây
 
-- Python 3.10+, Node.js 20+, FFmpeg và ffprobe trong `PATH`.
-- Chạy `npm install` tại thư mục repo. Các phiên bản Remotion được cố định trong `package.json`.
+Mở repo bằng GitHub Codespaces hoặc một môi trường Linux có Python 3.10+, Node.js 20+ và quyền cài FFmpeg. Codespaces tự chạy `scripts/setup-cloud.sh`. Ở môi trường Linux khác, chạy:
 
-Nếu FFmpeg không nằm trong `PATH`, đặt biến môi trường `VIDEO_CO_BAN_FFMPEG` và `VIDEO_CO_BAN_FFPROBE` trỏ đến hai file thực thi tương ứng.
+```bash
+bash scripts/setup-cloud.sh
+```
 
-## Đầu vào
+Đặt **đúng một file** `.mp4`, `.mov` hoặc `.mkv` vào `input/`. Có thể tải file từ điện thoại lên workspace trong giao diện cloud đang dùng, hoặc gửi video cho tác vụ Codex và yêu cầu đặt tệp đính kèm vào `input/`. Chương trình nhận video trong thư mục này; nó không tự truy cập thư viện ảnh trên điện thoại. Video và mọi bản render được `.gitignore`, không đưa lên GitHub.
 
-Đặt đúng **một video** (`.mp4`, `.mov` hoặc `.mkv`) và **một SRT cùng tên gốc** vào `input/`, ví dụ `input/bai-noi.mp4` và `input/bai-noi.srt`. File nguồn không bị sửa. Bản đầu yêu cầu video có cả hình và tiếng, SRT đã có mốc thời gian.
-
-## Dòng chảy
+## Dòng chảy có bước duyệt
 
 ```text
-01 ingest → 02 Pass 1 KEEP/DELETE → khóa kế hoạch cắt
-          → 02 Pass 2 chia phụ đề trên phần KEEP
-          → 03 resolve mốc thời gian → 04 FFmpeg clean.mp4
-          → 05 Remotion final.mp4 → 06 QA
+1 video → phiên âm thô → AI sửa lời theo ngữ cảnh
+        → AI đề xuất DELETE và lý do → NGƯỜI DÙNG DUYỆT
+        → khóa KEEP/DELETE → phụ đề trắng → Resolve
+        → FFmpeg clean.mp4 → Remotion final.mp4 → QA
 ```
 
-Hai pass là **hai quyết định biên tập của bạn hoặc Codex**, được lưu thành hai file JSON để xem và sửa. Chúng không tự gọi AI khi chạy lệnh. Quy tắc trong `prompts/` giúp Codex tạo từng file; chương trình kiểm tra hợp lệ trước khi render. Pass 2 không thể đổi KEEP/DELETE.
+### 1. Tự phiên âm và lập đề xuất
 
-### 1. Kiểm tra và tạo bản kế hoạch ban đầu
-
-```powershell
-python editor.py init
+```bash
+.venv/bin/python editor.py init
+.venv/bin/python editor.py review
 ```
 
-Lệnh tạo `plan/cut.json` (mặc định KEEP toàn bộ) và `plan/subtitles.json` (mặc định lấy nguyên văn từng cue SRT). Đây là dữ liệu khởi đầu **để chỉnh**, không phải kết quả AI đã biên tập. Nó cũng ghi báo cáo đầu vào vào `runs/current/ingest.json`.
+`init` dùng [faster-whisper](https://github.com/SYSTRAN/faster-whisper) để tạo `runs/current/raw.srt`, sau đó AI sửa theo ngữ cảnh thành `runs/current/corrected.srt` và ghi `runs/current/proposals.json`. Nếu bạn đã có SRT cùng tên trong `input/`, hệ dùng nó làm bản thô và vẫn chạy bước sửa theo ngữ cảnh. File `runs/current/proposals.json` lưu tên mô hình, các chỗ AI chưa chắc và các đề xuất cắt. `review` **chỉ báo những đoạn được đề xuất cắt**, mốc thời gian, lời và lý do. Chưa có lệnh duyệt thì hệ không render.
 
-### 2. Pass 1: quyết định cắt
+Mặc định bước sửa ngữ cảnh và đề xuất cắt dùng Codex CLI. Script cài đặt tải CLI; bạn cần đăng nhập bằng `node_modules/.bin/codex login` nếu môi trường chưa có phiên đăng nhập. Nếu dùng OpenAI API, đặt `VIDEO_CO_BAN_AI_BACKEND=openai` và `OPENAI_API_KEY` trong secret của môi trường; không ghi khóa vào repo. Có thể đổi model văn bản bằng `VIDEO_CO_BAN_TEXT_MODEL`. ASR mặc định dùng `medium` trên CPU hoặc `large-v3-turbo` khi đặt `VIDEO_CO_BAN_ASR_DEVICE=cuda`; đổi bằng `VIDEO_CO_BAN_ASR_MODEL`. Lần chạy đầu tải model nên cần mạng và dung lượng trống.
 
-Dùng [prompts/pass1.md](prompts/pass1.md) với Codex, hoặc tự sửa `plan/cut.json`. Mỗi dòng là một nhóm cue liên tiếp, có `decision` là `KEEP` hoặc `DELETE` và `reason`. Mọi cue phải được phủ đúng một lần. Sau khi xem và chốt:
+### 2. Người dùng quyết định
 
-```powershell
-python editor.py lock
+Ví dụ AI đề xuất ba đoạn `#1`, `#2`, `#3`. Muốn cắt **chỉ #1 và #3**:
+
+```bash
+.venv/bin/python editor.py review --approve 1,3
 ```
 
-Lệnh lưu bản khóa ở `runs/current/cut.lock.json`. Sửa `plan/cut.json` sau đó thì phải chạy `lock` lại; khi đó cũng cần xem lại Pass 2.
+Muốn giữ toàn bộ:
 
-### 3. Pass 2: phụ đề trắng
+```bash
+.venv/bin/python editor.py review --keep-all
+```
 
-Dùng [prompts/pass2.md](prompts/pass2.md) với Codex, hoặc sửa `plan/subtitles.json`. Mỗi mục tham chiếu một cue được KEEP và có một `text` tối đa hai dòng. Không thêm lời không có trong tiếng nói. Có thể bỏ một cue khỏi danh sách nếu cố ý không hiện chữ. `python editor.py prepare` sẽ báo lỗi nếu Pass 2 tham chiếu cue đã DELETE.
+Lệnh duyệt ghi `runs/current/approval.json`, `plan/cut.json`, `plan/subtitles.json` và khóa Pass 1. Những đề xuất không được duyệt đều được KEEP. Thay đổi video, phiên âm, đề xuất hoặc kế hoạch cắt sẽ làm khóa hết hiệu lực; phải duyệt lại. Có thể sửa chữ trong `plan/subtitles.json` sau khi duyệt, nhưng Pass 2 không được đổi KEEP/DELETE.
 
-### 4. Render và kiểm tra
+### 3. Render và kiểm tra
 
-```powershell
-python editor.py prepare
+```bash
+.venv/bin/python editor.py prepare
 npm run render
-python editor.py qa
+.venv/bin/python editor.py qa
 ```
 
-`prepare` tạo `runs/current/clean.mp4`, `public/clean.mp4` và `public/timeline.json`. Remotion đọc hai file trong `public/` để tạo `runs/current/final.mp4`. `qa` kiểm tra file cuối bằng ffprobe và giải mã toàn bộ bằng FFmpeg; kết quả ở `runs/current/qa.json`. Hãy xem/nghe video cuối để xác nhận điểm cắt và lời phụ đề.
+`prepare` ánh xạ thời gian và dùng FFmpeg tạo `runs/current/clean.mp4`. Remotion trong `src/` đặt phụ đề trắng lên video sạch và xuất `runs/current/final.mp4`. `qa` kiểm tra hình, tiếng, thời lượng và giải mã toàn file; báo cáo nằm trong `runs/current/qa.json`. Vẫn cần xem/nghe file cuối để nhận ra lỗi nội dung hoặc điểm cắt gắt mà kiểm tra kỹ thuật không phát hiện.
 
-Muốn xem hoặc sửa phần trình bày trong Remotion: `npm run studio`. Sau khi đổi phụ đề, chạy lại `prepare`, `npm run render`, `qa`. Sau khi đổi kế hoạch cắt, chạy lại từ `lock`.
+## Mở rộng sau này
 
-## Cấu trúc
+- `editor_ai.py`: backend phiên âm và AI. Có thể thay model ASR mà không sửa phần cắt hoặc Remotion.
+- `editor.py`: ingest, quyết định duyệt, khóa, cắt, ánh xạ mốc và QA.
+- `src/`: tầng trình bày Remotion; bắt đầu thêm hiệu ứng ở đây.
 
-- `editor.py`: ingest, kiểm tra kế hoạch, khóa, ánh xạ thời gian, FFmpeg và QA.
-- `plan/`: hai quyết định của Pass 1 và Pass 2.
-- `src/`: component Remotion. Bắt đầu mở rộng hiệu ứng tại đây.
-- `input/`: file gốc, không đưa lên Git.
-- `runs/`, `public/`: file tạo ra khi chạy, không đưa lên Git.
-
-`clean.mp4` giữ tỷ lệ và kích thước nguồn. Dùng SRT đúng tiếng nói; bản mẫu không tự phiên âm hoặc tự sửa lỗi nhận dạng lời nói.
-
+AI hiện sửa lời dựa trên bản phiên âm máy và ngữ cảnh các cue lân cận. Những chỗ chưa chắc được ghi trong `proposals.json` để người dùng nghe lại; không coi bản sửa tự động là bằng chứng tuyệt đối về âm thanh gốc.
 
