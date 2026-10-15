@@ -90,14 +90,32 @@ def parse_srt(path: Path) -> list[dict]:
     return cues
 
 
-def source() -> tuple[Path, Path, list[dict], dict]:
+def srt_time(value: int) -> str:
+    hours, rest = divmod(value, 3600000)
+    minutes, rest = divmod(rest, 60000)
+    seconds, milli = divmod(rest, 1000)
+    return f"{hours:02}:{minutes:02}:{seconds:02},{milli:03}"
+
+
+def write_srt(path: Path, cues: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n\n".join(
+        f"{cue['id']}\n{srt_time(cue['start_ms'])} --> {srt_time(cue['end_ms'])}\n{cue['text']}"
+        for cue in cues) + "\n", encoding="utf-8")
+
+
+def find_video() -> Path:
     videos = [p for p in INPUT.iterdir() if p.suffix.lower() in {".mp4", ".mov", ".mkv"}]
     if len(videos) != 1:
-        fail("input/ cần đúng một video")
-    video = videos[0]
-    srt = video.with_suffix(".srt")
+        fail("input/ cần đúng một video MP4, MOV hoặc MKV")
+    return videos[0]
+
+
+def source() -> tuple[Path, Path, list[dict], dict]:
+    video = find_video()
+    srt = RUN / "corrected.srt"
     if not srt.is_file():
-        fail(f"Thiếu SRT cùng tên: {srt.name}")
+        fail("Chưa có bản phiên âm đã sửa. Chạy python editor.py init")
     cues = parse_srt(srt)
     info = probe(video)
     streams = info.get("streams", [])
@@ -110,16 +128,87 @@ def source() -> tuple[Path, Path, list[dict], dict]:
 
 
 def init() -> None:
-    video, srt, cues, info = source()
+    from editor_ai import correct_context, propose_cuts, transcribe
+
+    # A new analysis invalidates every earlier human decision, even if AI fails later.
+    for stale in (RUN / "approval.json", RUN / "cut.lock.json", RUN / "proposals.json"):
+        stale.unlink(missing_ok=True)
+    video = find_video()
+    info = probe(video)
+    streams = info.get("streams", [])
+    if not any(s.get("codec_type") == "video" for s in streams) or not any(s.get("codec_type") == "audio" for s in streams):
+        fail("Video cần có cả hình và tiếng")
+    supplied_srt = video.with_suffix(".srt")
+    if supplied_srt.is_file():
+        raw = parse_srt(supplied_srt)
+        asr = {"backend": "supplied-srt", "model": None}
+    else:
+        raw, asr = transcribe(video, RUN)
+    if raw[-1]["end_ms"] > float(info["format"]["duration"]) * 1000 + 100:
+        fail("Phiên âm vượt thời lượng video")
+    write_srt(RUN / "raw.srt", raw)
+    corrected, uncertain = correct_context(raw, RUN / "ai")
+    write_srt(RUN / "corrected.srt", corrected)
+    proposals = propose_cuts(corrected, RUN / "ai")
+    write_json(RUN / "proposals.json", {"video": video.name, "video_sha256": digest(video),
+               "srt_sha256": digest(RUN / "corrected.srt"), "asr": asr,
+               "uncertain": uncertain, "cuts": proposals})
+    write_json(RUN / "ingest.json", {"video": video.name, "duration_seconds": float(info["format"]["duration"]),
+               "cue_count": len(corrected), "asr": asr, "status": "AWAITING_USER_CUT_DECISION"})
+    print(f"Đã phiên âm, sửa theo ngữ cảnh và tạo {len(proposals)} đề xuất cắt. Chạy python editor.py review để xem.")
+
+
+def cut_rows(cues: list[dict], proposals: list[dict], approved: set[int]) -> list[dict]:
+    decision = {cue["id"]: ("KEEP", "Người dùng giữ") for cue in cues}
+    for proposal in proposals:
+        if proposal["id"] in approved:
+            for cue in cues:
+                if proposal["start_cue"] <= cue["id"] <= proposal["end_cue"]:
+                    decision[cue["id"]] = ("DELETE", proposal["reason"])
+    rows = []
+    for cue in cues:
+        action, reason = decision[cue["id"]]
+        if rows and (rows[-1]["decision"], rows[-1]["reason"]) == (action, reason):
+            rows[-1]["end_cue"] = cue["id"]
+        else:
+            rows.append({"start_cue": cue["id"], "end_cue": cue["id"], "decision": action, "reason": reason})
+    return rows
+
+
+def review(approve: str | None, keep_all: bool) -> None:
+    video, srt, cues, _ = source()
+    proposal_path = RUN / "proposals.json"
+    data = read_json(proposal_path)
+    if data["video_sha256"] != digest(video) or data["srt_sha256"] != digest(srt):
+        fail("Video hoặc phiên âm đã đổi. Chạy python editor.py init lại")
+    cuts = data["cuts"]
+    print("Các đoạn AI ĐỀ XUẤT cắt; chưa đoạn nào được thi hành:")
+    for item in cuts:
+        print(f"  #{item['id']} {srt_time(item['start_ms'])}–{srt_time(item['end_ms'])}: {item['text']}\n     Lý do: {item['reason']}")
+    if not cuts:
+        print("  Không có đề xuất cắt.")
+    if approve is None and not keep_all:
+        print("Duyệt bằng --approve 1,3 (chỉ cắt #1 và #3) hoặc --keep-all. Không duyệt thì không render.")
+        return
+    valid = {item["id"] for item in cuts}
+    approved = set()
+    if approve is not None:
+        try:
+            approved = {int(part.strip()) for part in approve.split(",") if part.strip()}
+        except ValueError:
+            fail("--approve cần danh sách ID, ví dụ 1,3")
+        if not approved or not approved.issubset(valid):
+            fail("ID duyệt không thuộc danh sách đề xuất")
+    rows = cut_rows(cues, cuts, approved)
+    kept = validate_cut(rows, cues)
     PLAN.mkdir(exist_ok=True)
-    cut = PLAN / "cut.json"
-    subs = PLAN / "subtitles.json"
-    if not cut.exists():
-        write_json(cut, [{"start_cue": cues[0]["id"], "end_cue": cues[-1]["id"], "decision": "KEEP", "reason": "Bản đầu: giữ toàn bộ để học viên xem và sửa"}])
-    if not subs.exists():
-        write_json(subs, [{"cue": cue["id"], "text": cue["text"]} for cue in cues])
-    write_json(RUN / "ingest.json", {"video": video.name, "srt": srt.name, "duration_seconds": float(info["format"]["duration"]), "cue_count": len(cues), "status": "PASS"})
-    print("Đã kiểm tra đầu vào và tạo kế hoạch ban đầu trong plan/.")
+    write_json(PLAN / "cut.json", rows)
+    write_json(PLAN / "subtitles.json", [{"cue": cue["id"], "text": cue["text"]} for cue in kept])
+    write_json(RUN / "approval.json", {"proposal_sha256": digest(proposal_path),
+               "video_sha256": digest(video), "srt_sha256": digest(srt),
+               "cut_sha256": digest(PLAN / "cut.json"), "approved_cut_ids": sorted(approved)})
+    lock()
+    print(f"Đã duyệt: cắt {len(approved)} đề xuất, giữ {len(kept)}/{len(cues)} cue.")
 
 
 def validate_cut(rows: list, cues: list[dict]) -> list[dict]:
@@ -148,6 +237,11 @@ def validate_cut(rows: list, cues: list[dict]) -> list[dict]:
 
 def lock() -> None:
     video, srt, cues, _ = source()
+    approval = read_json(RUN / "approval.json")
+    if (approval["proposal_sha256"] != digest(RUN / "proposals.json")
+            or approval["cut_sha256"] != digest(PLAN / "cut.json")
+            or approval["video_sha256"] != digest(video) or approval["srt_sha256"] != digest(srt)):
+        fail("Kế hoạch cắt chưa được người dùng duyệt hoặc đã đổi. Chạy python editor.py review")
     rows = read_json(PLAN / "cut.json")
     kept = validate_cut(rows, cues)
     write_json(RUN / "cut.lock.json", {"video": video.name, "video_sha256": digest(video), "srt_sha256": digest(srt), "cut_sha256": digest(PLAN / "cut.json"), "rows": rows, "kept_cues": [cue["id"] for cue in kept]})
@@ -159,6 +253,9 @@ def locked_source() -> tuple[Path, list[dict], dict, dict]:
     locked = read_json(RUN / "cut.lock.json")
     if locked["video"] != video.name or locked["video_sha256"] != digest(video) or locked["srt_sha256"] != digest(srt) or locked["cut_sha256"] != digest(PLAN / "cut.json"):
         fail("Nguồn hoặc Pass 1 đã đổi. Chạy python editor.py lock lại")
+    approval = read_json(RUN / "approval.json")
+    if approval["proposal_sha256"] != digest(RUN / "proposals.json") or approval["cut_sha256"] != digest(PLAN / "cut.json"):
+        fail("Thiếu quyết định duyệt hợp lệ của người dùng")
     validate_cut(locked["rows"], cues)
     return video, cues, info, locked
 
@@ -257,7 +354,16 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Video cơ bản: ingest, khóa cắt, render sạch và QA")
-    parser.add_argument("step", choices=["init", "lock", "prepare", "qa"])
-    step = parser.parse_args().step
-    {"init": init, "lock": lock, "prepare": prepare, "qa": qa}[step]()
+    parser.add_argument("step", choices=["init", "review", "lock", "prepare", "qa"])
+    parser.add_argument("--approve", help="ID đề xuất được người dùng duyệt cắt, ví dụ 1,3")
+    parser.add_argument("--keep-all", action="store_true", help="Người dùng bác bỏ mọi đề xuất cắt")
+    args = parser.parse_args()
+    if args.step == "review":
+        if args.approve and args.keep_all:
+            fail("Chỉ dùng một trong --approve hoặc --keep-all")
+        review(args.approve, args.keep_all)
+    else:
+        if args.approve or args.keep_all:
+            fail("--approve/--keep-all chỉ dùng với review")
+        {"init": init, "lock": lock, "prepare": prepare, "qa": qa}[args.step]()
 
