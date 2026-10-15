@@ -1,0 +1,11 @@
+input/*
+!input/.gitkeep
+plan/*.json
+runs/
+public/
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+
