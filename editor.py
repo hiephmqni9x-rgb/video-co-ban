@@ -260,7 +260,55 @@ def locked_source() -> tuple[Path, list[dict], dict, dict]:
     return video, cues, info, locked
 
 
-def segments(cues: list[dict], kept_ids: list[int], duration_ms: int) -> list[dict]:
+# Cắt khoảng lặng: cùng luật với bản 8.6.2 (build_tight_plan). Chỉ cắt trong khoảng lặng
+# do ÂM THANH xác nhận, nằm giữa hai cue liền nhau của cùng một đoạn KEEP.
+SILENCE_NOISE_DB = -20      # ngưỡng im lặng của silencedetect
+SILENCE_MIN_S = 0.2         # khoảng lặng tối thiểu để silencedetect báo
+MIN_GAP_MS = 250            # chỗ nghỉ giữa hai cue nhỏ hơn mức này thì không đụng tới
+SILENCE_SLACK_MS = 50       # cho khoảng lặng lấn ra hai bên cue tối đa mức này (mốc cue có thể lệch)
+MIN_SILENCE_MS = 230        # khoảng lặng ứng viên phải dài hơn mức này
+KEEP_EDGE_MS = 40           # phần lặng giữ lại sát mỗi bên chỗ cắt
+MIN_CUT_MS = 150            # phần bị cắt phải dài ít nhất mức này
+
+
+def detect_silences(video: Path) -> list[tuple[int, int]]:
+    """Đo khoảng lặng thật bằng ffmpeg silencedetect, trả về danh sách (bắt đầu, kết thúc) tính bằng ms."""
+    result = subprocess.run([tool("ffmpeg"), "-hide_banner", "-nostats", "-i", str(video), "-vn",
+                             "-af", f"silencedetect=noise={SILENCE_NOISE_DB}dB:d={SILENCE_MIN_S}",
+                             "-f", "null", os.devnull],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode:
+        fail("Đo khoảng lặng thất bại: " + result.stderr[-2000:])
+    starts = [round(float(x) * 1000) for x in re.findall(r"silence_start: (-?[0-9.]+)", result.stderr)]
+    ends = [round(float(x) * 1000) for x in re.findall(r"silence_end: ([0-9.]+)", result.stderr)]
+    return [(a, b) for a, b in zip(starts, ends) if b > a]
+
+
+def pause_cuts(group: list[dict], row_start: int, row_end: int, silences: list[tuple[int, int]]) -> list[tuple[int, int, int, int]]:
+    """Tìm các đoạn nghỉ thừa trong một đoạn KEEP. Trả về (a, b, id_cue_trước, id_cue_sau): bỏ [a, b)."""
+    cuts = []
+    for before, after in zip(group, group[1:]):
+        if after["start_ms"] - before["end_ms"] < MIN_GAP_MS:
+            continue
+        candidates = []
+        for silence_start, silence_end in silences:
+            lo = max(silence_start, before["end_ms"] - SILENCE_SLACK_MS, row_start)
+            hi = min(silence_end, after["start_ms"] + SILENCE_SLACK_MS, row_end)
+            if hi - lo >= MIN_SILENCE_MS:
+                candidates.append((hi - lo, lo, hi))
+        if not candidates:
+            continue
+        _, lo, hi = max(candidates)
+        a, b = lo + KEEP_EDGE_MS, hi - KEEP_EDGE_MS
+        # Không bao giờ cắt vào lời: phần bỏ phải nằm gọn giữa hai cue
+        if b - a >= MIN_CUT_MS and a >= before["end_ms"] and b <= after["start_ms"]:
+            cuts.append((a, b, before["id"], after["id"]))
+    return cuts
+
+
+def segments(cues: list[dict], kept_ids: list[int], duration_ms: int,
+             silences: list[tuple[int, int]] | None = None) -> tuple[list[dict], list[dict]]:
+    """Trả về (các đoạn giữ, các đoạn nghỉ đã cắt). Không truyền silences thì chỉ cắt theo cue DELETE như cũ."""
     keep = set(kept_ids)
     groups = []
     current = []
@@ -273,13 +321,29 @@ def segments(cues: list[dict], kept_ids: list[int], duration_ms: int) -> list[di
     if current:
         groups.append(current)
     result = []
+    removed = []
     cursor = 0
-    for index, group in enumerate(groups):
+    for group in groups:
         start = 0 if group[0]["id"] == cues[0]["id"] else group[0]["start_ms"]
         end = duration_ms if group[-1]["id"] == cues[-1]["id"] else group[-1]["end_ms"]
-        result.append({"source_start_ms": start, "source_end_ms": end, "output_start_ms": cursor})
-        cursor += end - start
-    return result
+        position = start
+        for a, b, before_id, after_id in pause_cuts(group, start, end, silences or []):
+            if a <= position:
+                continue
+            result.append({"source_start_ms": position, "source_end_ms": a, "output_start_ms": cursor})
+            cursor += a - position
+            removed.append({"start_ms": a, "end_ms": b, "between_cues": [before_id, after_id]})
+            position = b
+        if position < end:
+            result.append({"source_start_ms": position, "source_end_ms": end, "output_start_ms": cursor})
+            cursor += end - position
+    # Mỗi cue được giữ phải nằm gọn trong đúng một đoạn, nếu không thì dừng
+    for cue in cues:
+        if cue["id"] in keep:
+            inside = [s for s in result if s["source_start_ms"] <= cue["start_ms"] and cue["end_ms"] <= s["source_end_ms"]]
+            if len(inside) != 1:
+                fail(f"Cắt khoảng lặng làm cue {cue['id']} bị cắt đôi hoặc mất")
+    return result, removed
 
 
 def prepare() -> None:
@@ -300,7 +364,7 @@ def prepare() -> None:
         if not isinstance(item["text"], str) or not item["text"].strip() or len(item["text"].splitlines()) > 2:
             fail(f"Phụ đề cue {cue_id} phải có chữ và tối đa hai dòng")
     duration_ms = round(float(info["format"]["duration"]) * 1000)
-    spans = segments(cues, locked["kept_cues"], duration_ms)
+    spans, removed_pauses = segments(cues, locked["kept_cues"], duration_ms, detect_silences(video))
     total_ms = spans[-1]["output_start_ms"] + spans[-1]["source_end_ms"] - spans[-1]["source_start_ms"]
     filters = []
     for index, span in enumerate(spans):
@@ -327,8 +391,10 @@ def prepare() -> None:
     PUBLIC.mkdir(exist_ok=True)
     shutil.copy2(clean, PUBLIC / "clean.mp4")
     write_json(PUBLIC / "timeline.json", timeline)
-    write_json(RUN / "resolve.json", {"segments": spans, "expected_duration_ms": total_ms, "subtitle_count": len(timeline["subtitles"]), "status": "PASS"})
-    print(f"Đã tạo clean.mp4 ({total_ms / 1000:.2f}s) và timeline cho Remotion.")
+    write_json(RUN / "resolve.json", {"segments": spans, "removed_pauses": removed_pauses, "expected_duration_ms": total_ms, "subtitle_count": len(timeline["subtitles"]), "status": "PASS"})
+    saved_ms = sum(p["end_ms"] - p["start_ms"] for p in removed_pauses)
+    print(f"Đã tạo clean.mp4 ({total_ms / 1000:.2f}s) và timeline cho Remotion. "
+          f"Cắt {len(removed_pauses)} khoảng lặng thừa, bớt {saved_ms / 1000:.2f}s.")
 
 
 def qa() -> None:
