@@ -306,6 +306,29 @@ def pause_cuts(group: list[dict], row_start: int, row_end: int, silences: list[t
     return cuts
 
 
+TARGET_GAP_SAME_MS = 80     # khoảng nghỉ đích ở mối nối cùng một đoạn KEEP (đã rút bớt chỗ lặng)
+TARGET_GAP_JOIN_MS = 60     # khoảng nghỉ đích ở mối nối giữa hai đoạn KEEP khác nhau (sau khi bỏ cue DELETE)
+
+
+def junctions(spans: list[dict], removed: list[dict], by_id: dict[int, dict]) -> list[dict]:
+    """Danh sách mối nối như `junctions` của 8.6.2. `target_gap_ms` là mục tiêu GHI LẠI để đối chiếu,
+    chưa phải luật thi hành: khoảng nghỉ thực tế nằm ở `actual_gap_ms`."""
+    pauses = {item["start_ms"]: item for item in removed}
+    result = []
+    for index, (left, right) in enumerate(zip(spans, spans[1:]), 1):
+        pause = pauses.get(left["source_end_ms"])
+        if pause:
+            before, after = (by_id[i] for i in pause["between_cues"])
+            actual = (after["start_ms"] - before["end_ms"]) - (pause["end_ms"] - pause["start_ms"])
+            kind, target = "tightened_source_pause", TARGET_GAP_SAME_MS
+        else:
+            actual = 0  # nối đúng mép cue, không đệm
+            kind, target = "semantic_join", TARGET_GAP_JOIN_MS
+        result.append({"after_segment": index, "type": kind, "target_gap_ms": target, "actual_gap_ms": actual,
+                       "source_gap_removed_ms": right["source_start_ms"] - left["source_end_ms"]})
+    return result
+
+
 def segments(cues: list[dict], kept_ids: list[int], duration_ms: int,
              silences: list[tuple[int, int]] | None = None) -> tuple[list[dict], list[dict]]:
     """Trả về (các đoạn giữ, các đoạn nghỉ đã cắt). Không truyền silences thì chỉ cắt theo cue DELETE như cũ."""
@@ -391,7 +414,7 @@ def prepare() -> None:
     PUBLIC.mkdir(exist_ok=True)
     shutil.copy2(clean, PUBLIC / "clean.mp4")
     write_json(PUBLIC / "timeline.json", timeline)
-    write_json(RUN / "resolve.json", {"segments": spans, "removed_pauses": removed_pauses, "expected_duration_ms": total_ms, "subtitle_count": len(timeline["subtitles"]), "status": "PASS"})
+    write_json(RUN / "resolve.json", {"segments": spans, "removed_pauses": removed_pauses, "junctions": junctions(spans, removed_pauses, by_id), "expected_duration_ms": total_ms, "subtitle_count": len(timeline["subtitles"]), "status": "PASS"})
     saved_ms = sum(p["end_ms"] - p["start_ms"] for p in removed_pauses)
     print(f"Đã tạo clean.mp4 ({total_ms / 1000:.2f}s) và timeline cho Remotion. "
           f"Cắt {len(removed_pauses)} khoảng lặng thừa, bớt {saved_ms / 1000:.2f}s.")

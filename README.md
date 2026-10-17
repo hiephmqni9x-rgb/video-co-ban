@@ -70,6 +70,8 @@ Ngoài việc bỏ các cue DELETE đã duyệt, `prepare` còn bớt những ch
 | Giữ lại mỗi bên | 40 ms | nghỉ còn lại khoảng 80 ms |
 | Phần bị cắt | ≥ 150 ms, nằm gọn giữa hai cue | không bao giờ cắt vào lời |
 
+Mỗi mối nối được ghi vào `junctions` trong `resolve.json` với `target_gap_ms` là **80 ms** (mối nối ở chỗ đã rút bớt lặng, cùng đoạn KEEP) hoặc **60 ms** (mối nối giữa hai đoạn KEEP khác nhau sau khi bỏ cue DELETE), kèm `actual_gap_ms` là khoảng nghỉ thực tế sau khi cắt. Giống 8.6.2, `target_gap_ms` hiện **chỉ để ghi và đối chiếu**, chưa phải luật thi hành: ví dụ mối nối giữa hai đoạn KEEP đang nối sát mép cue (`actual_gap_ms` = 0), thấp hơn mục tiêu 60.
+
 Nhiều khoảng lặng trong cùng một chỗ nghỉ thì chọn khoảng dài nhất. Cue nào bị cắt đôi hoặc mất thì dừng và báo lỗi. Các khoảng đã cắt được ghi ở `removed_pauses` trong `runs/current/resolve.json`. Hằng số nằm đầu phần "Cắt khoảng lặng" của `editor.py`.
 
 **Giới hạn:** đơn vị là cue của Whisper (cả câu), nên chỉ cắt được chỗ nghỉ **giữa các câu**, chưa cắt được chỗ ngập ngừng **trong một câu**; muốn vậy cần mốc từng từ (`word_timestamps`). Hiện chưa có fade âm ở mối nối. Kiểm tra: `python -m unittest discover -s tests -v`.

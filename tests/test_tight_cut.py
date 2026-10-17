@@ -65,6 +65,18 @@ class PauseCutsLogic(unittest.TestCase):
                          [(0, 1040, 0), (1760, 4000, 1040)])
         self.assertEqual(removed, [{"start_ms": 1040, "end_ms": 1760, "between_cues": [1, 2]}])
 
+    def test_junctions_record_80_for_pause_and_60_for_join(self):
+        cues = [cue(1, 0, 1000), cue(2, 1800, 2800), cue(3, 3600, 4600), cue(4, 4800, 5800)]
+        by_id = {c["id"]: c for c in cues}
+        # cue 3 bị DELETE: đoạn KEEP thứ nhất gồm cue 1-2 (có nghỉ bị cắt), đoạn thứ hai là cue 4
+        spans, removed = editor.segments(cues, [1, 2, 4], 5800, [(1000, 1800)])
+        result = editor.junctions(spans, removed, by_id)
+        self.assertEqual([j["type"] for j in result], ["tightened_source_pause", "semantic_join"])
+        self.assertEqual([j["target_gap_ms"] for j in result], [80, 60])
+        self.assertEqual(result[0]["actual_gap_ms"], 80)   # 800 - 720 bị cắt
+        self.assertEqual(result[1]["actual_gap_ms"], 0)    # nối sát mép cue
+        self.assertEqual(result[0]["source_gap_removed_ms"], 720)
+
     def test_pause_not_cut_across_deleted_cue(self):
         # Cue 2 bị DELETE: hai đoạn KEEP khác nhau, luật cắt lặng chỉ chạy bên trong từng đoạn
         cues = [cue(1, 0, 1000), cue(2, 1800, 2800), cue(3, 3600, 4600)]
